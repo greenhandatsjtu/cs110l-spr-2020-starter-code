@@ -1,19 +1,36 @@
 use crate::debugger_command::DebuggerCommand;
-use crate::inferior::Inferior;
+use crate::inferior::{Inferior, Status};
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
+use crate::dwarf_data::{DwarfData, Error as DwarfError};
+use nix::Error;
 
 pub struct Debugger {
     target: String,
     history_path: String,
     readline: Editor<()>,
     inferior: Option<Inferior>,
+    debug_data: DwarfData,
+    breakpoints: Vec<usize>,
 }
 
 impl Debugger {
     /// Initializes the debugger.
     pub fn new(target: &str) -> Debugger {
-        // TODO (milestone 3): initialize the DwarfData
+        // initialize the DwarfData
+        let debug_data = match DwarfData::from_file(target) {
+            Ok(val) => val,
+            Err(DwarfError::ErrorOpeningFile) => {
+                println!("Could not open file {}", target);
+                std::process::exit(1);
+            }
+            Err(DwarfError::DwarfFormatError(err)) => {
+                println!("Could not debugging symbols from {}: {:?}", target, err);
+                std::process::exit(1);
+            }
+        };
+        debug_data.print();
+
 
         let history_path = format!("{}/.deet_history", std::env::var("HOME").unwrap());
         let mut readline = Editor::<()>::new();
@@ -25,6 +42,46 @@ impl Debugger {
             history_path,
             readline,
             inferior: None,
+            debug_data,
+            breakpoints: Vec::new(),
+        }
+    }
+
+    pub fn cont(&mut self) {
+        if self.inferior.is_none() {
+            println!("The program is not being run.");
+            return;
+        }
+        let result = self.inferior.as_mut().unwrap().cont();
+        match result {
+            Ok(status) => {
+                match status {
+                    Status::Exited(exit_code) => {
+                        println!("Child exited (status {})", exit_code);
+                        self.inferior = None;
+                    }
+                    Status::Signaled(signal) => {
+                        println!("Child exited (signal {})", signal);
+                        self.inferior = None;
+                    }
+                    Status::Stopped(signal, rip)
+                    => {
+                        println!("Child stopped (signal {})", signal);
+                        let line = match self.debug_data.get_line_from_addr(rip as usize) {
+                            None => return,
+                            Some(val) => val
+                        };
+                        let func = match self.debug_data.get_function_from_addr(rip as usize) {
+                            None => return,
+                            Some(val) => val
+                        };
+                        println!("Stopped at {} ({})", func, line);
+                    }
+                }
+            }
+            Err(e) => {
+                println!("{}", e);
+            }
         }
     }
 
@@ -32,17 +89,57 @@ impl Debugger {
         loop {
             match self.get_next_command() {
                 DebuggerCommand::Run(args) => {
-                    if let Some(inferior) = Inferior::new(&self.target, &args) {
+                    if self.inferior.is_some() {
+                        self.inferior.as_mut().unwrap().kill().unwrap();
+                    }
+                    if let Some(inferior) = Inferior::new(&self.target, &args, &self.breakpoints) {
                         // Create the inferior
                         self.inferior = Some(inferior);
-                        // TODO (milestone 1): make the inferior run
+                        // (milestone 1): make the inferior run
                         // You may use self.inferior.as_mut().unwrap() to get a mutable reference
                         // to the Inferior object
+                        self.cont();
                     } else {
                         println!("Error starting subprocess");
                     }
                 }
+                DebuggerCommand::Continue => {
+                    self.cont();
+                }
+                DebuggerCommand::Backtrace => {
+                    if self.inferior.is_none() {
+                        println!("The program is not being run.");
+                        continue;
+                    }
+                    self.inferior.as_mut().unwrap().print_backtrace(&self.debug_data).unwrap();
+                }
+                DebuggerCommand::Break(addr) => {
+                    if !addr.starts_with('*') {
+                        continue;
+                    }
+                    let res = parse_address(&addr[1..]);
+                    match res {
+                        Some(addr) => {
+                            println!("Set breakpoint {} at {:#x}", self.breakpoints.len(), addr);
+                            if self.inferior.is_some() {
+                                let res = self.inferior.as_mut().unwrap().write_byte(addr, 0xcc);
+                                match res {
+                                    Ok(_) => { self.breakpoints.push(addr); }
+                                    Err(_) => { println!("Unable to set breakpoint at {:#x}", addr); }
+                                }
+                            } else {
+                                self.breakpoints.push(addr);
+                            }
+                        }
+                        None => {
+                            println!("Please provide a valid address!");
+                        }
+                    }
+                }
                 DebuggerCommand::Quit => {
+                    if self.inferior.is_some() {
+                        self.inferior.as_mut().unwrap().kill().unwrap();
+                    }
                     return;
                 }
             }
@@ -89,4 +186,14 @@ impl Debugger {
             }
         }
     }
+}
+
+// parse a usize from a hexadecimal string
+fn parse_address(addr: &str) -> Option<usize> {
+    let addr_without_0x = if addr.to_lowercase().starts_with("0x") {
+        &addr[2..]
+    } else {
+        &addr
+    };
+    usize::from_str_radix(addr_without_0x, 16).ok()
 }
