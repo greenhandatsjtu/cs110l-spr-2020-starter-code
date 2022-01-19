@@ -1,9 +1,17 @@
+use std::collections::HashMap;
+
 use crate::debugger_command::DebuggerCommand;
+use crate::dwarf_data::{DwarfData, Error as DwarfError};
 use crate::inferior::{Inferior, Status};
+use nix::sys::ptrace;
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
-use crate::dwarf_data::{DwarfData, Error as DwarfError};
-use nix::Error;
+
+#[derive(Clone)]
+pub struct Breakpoint {
+    addr: usize,
+    pub orig_byte: u8,
+}
 
 pub struct Debugger {
     target: String,
@@ -11,7 +19,7 @@ pub struct Debugger {
     readline: Editor<()>,
     inferior: Option<Inferior>,
     debug_data: DwarfData,
-    breakpoints: Vec<usize>,
+    breakpoints: HashMap<usize, Breakpoint>,
 }
 
 impl Debugger {
@@ -31,7 +39,6 @@ impl Debugger {
         };
         debug_data.print();
 
-
         let history_path = format!("{}/.deet_history", std::env::var("HOME").unwrap());
         let mut readline = Editor::<()>::new();
         // Attempt to load history from ~/.deet_history if it exists
@@ -43,7 +50,7 @@ impl Debugger {
             readline,
             inferior: None,
             debug_data,
-            breakpoints: Vec::new(),
+            breakpoints: HashMap::new(),
         }
     }
 
@@ -52,33 +59,53 @@ impl Debugger {
             println!("The program is not being run.");
             return;
         }
-        let result = self.inferior.as_mut().unwrap().cont();
+        let result = self.inferior.as_mut().unwrap().cont(&self.breakpoints);
         match result {
-            Ok(status) => {
-                match status {
-                    Status::Exited(exit_code) => {
-                        println!("Child exited (status {})", exit_code);
-                        self.inferior = None;
-                    }
-                    Status::Signaled(signal) => {
-                        println!("Child exited (signal {})", signal);
-                        self.inferior = None;
-                    }
-                    Status::Stopped(signal, rip)
-                    => {
-                        println!("Child stopped (signal {})", signal);
-                        let line = match self.debug_data.get_line_from_addr(rip as usize) {
-                            None => return,
-                            Some(val) => val
-                        };
-                        let func = match self.debug_data.get_function_from_addr(rip as usize) {
-                            None => return,
-                            Some(val) => val
-                        };
-                        println!("Stopped at {} ({})", func, line);
+            Ok(status) => match status {
+                Status::Exited(exit_code) => {
+                    println!("Child exited (status {})", exit_code);
+                    self.inferior = None;
+                }
+                Status::Signaled(signal) => {
+                    println!("Child exited (signal {})", signal);
+                    self.inferior = None;
+                }
+                Status::Stopped(signal, rip) => {
+                    println!("Child stopped (signal {})", signal);
+                    let line = match self.debug_data.get_line_from_addr(rip as usize) {
+                        None => return,
+                        Some(val) => val,
+                    };
+                    let func = match self.debug_data.get_function_from_addr(rip as usize) {
+                        None => return,
+                        Some(val) => val,
+                    };
+                    println!("Stopped at {} ({})", func, line);
+                    let pid = self.inferior.as_ref().unwrap().pid();
+                    let mut regs = ptrace::getregs(pid).unwrap();
+                    regs.rip -= 1;
+                    // if inferior is stopped at a breakpoint
+                    if self.breakpoints.contains_key(&(regs.rip as usize)) {
+                        // rewind the instruction pointer (subtract 1 byte)
+                        if ptrace::setregs(pid, regs).is_err() {
+                            println!("Unable to set rip");
+                            return;
+                        }
+
+                        let bp = self.breakpoints.get(&(regs.rip as usize)).unwrap();
+                        // restore instruction
+                        if self
+                            .inferior
+                            .as_mut()
+                            .unwrap()
+                            .write_byte(bp.addr, bp.orig_byte)
+                            .is_err()
+                        {
+                            println!("Unable to restore instruction at {:#x}", bp.addr);
+                        }
                     }
                 }
-            }
+            },
             Err(e) => {
                 println!("{}", e);
             }
@@ -92,7 +119,9 @@ impl Debugger {
                     if self.inferior.is_some() {
                         self.inferior.as_mut().unwrap().kill().unwrap();
                     }
-                    if let Some(inferior) = Inferior::new(&self.target, &args, &self.breakpoints) {
+                    if let Some(inferior) =
+                        Inferior::new(&self.target, &args, &mut self.breakpoints)
+                    {
                         // Create the inferior
                         self.inferior = Some(inferior);
                         // (milestone 1): make the inferior run
@@ -111,7 +140,11 @@ impl Debugger {
                         println!("The program is not being run.");
                         continue;
                     }
-                    self.inferior.as_mut().unwrap().print_backtrace(&self.debug_data).unwrap();
+                    self.inferior
+                        .as_mut()
+                        .unwrap()
+                        .print_backtrace(&self.debug_data)
+                        .unwrap();
                 }
                 DebuggerCommand::Break(addr) => {
                     if !addr.starts_with('*') {
@@ -124,11 +157,17 @@ impl Debugger {
                             if self.inferior.is_some() {
                                 let res = self.inferior.as_mut().unwrap().write_byte(addr, 0xcc);
                                 match res {
-                                    Ok(_) => { self.breakpoints.push(addr); }
-                                    Err(_) => { println!("Unable to set breakpoint at {:#x}", addr); }
+                                    Ok(orig_byte) => {
+                                        self.breakpoints
+                                            .insert(addr, Breakpoint { addr, orig_byte });
+                                    }
+                                    Err(_) => {
+                                        println!("Unable to set breakpoint at {:#x}", addr);
+                                    }
                                 }
                             } else {
-                                self.breakpoints.push(addr);
+                                self.breakpoints
+                                    .insert(addr, Breakpoint { addr, orig_byte: 0 });
                             }
                         }
                         None => {

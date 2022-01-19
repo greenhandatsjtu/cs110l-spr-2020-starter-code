@@ -1,12 +1,14 @@
+use crate::debugger::Breakpoint;
+use crate::dwarf_data::DwarfData;
 use nix::sys::ptrace;
 use nix::sys::signal;
+use nix::sys::signal::Signal;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
-use std::process::{Child, Command};
-use std::os::unix::process::CommandExt;
+use std::collections::HashMap;
 use std::mem::size_of;
-use nix::sys::signal::Signal;
-use crate::dwarf_data::{DwarfData, Line};
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command};
 
 pub enum Status {
     /// Indicates inferior stopped. Contains the signal that stopped the process, as well as the
@@ -41,22 +43,34 @@ pub struct Inferior {
 impl Inferior {
     /// Attempts to start a new inferior process. Returns Some(Inferior) if successful, or None if
     /// an error is encountered.
-    pub fn new(target: &str, args: &Vec<String>, breakpoints: &Vec<usize>) -> Option<Inferior> {
+    pub fn new(
+        target: &str,
+        args: &Vec<String>,
+        breakpoints: &mut HashMap<usize, Breakpoint>,
+    ) -> Option<Inferior> {
         let mut cmd = Command::new(&target);
         cmd.args(args);
         unsafe {
             cmd.pre_exec(child_traceme);
         }
-        let mut inferior = Inferior { child: cmd.spawn().ok()? };
+        let mut inferior = Inferior {
+            child: cmd.spawn().ok()?,
+        };
         let status = inferior.wait(Some(WaitPidFlag::WUNTRACED)).ok()?;
         if let Status::Stopped(signal, _) = status {
             if signal != Signal::SIGTRAP {
                 return None;
             }
             for bp in breakpoints {
-                let res = inferior.write_byte(*bp, 0xcc);
-                if res.is_err() {
-                    println!("Unable to set breakpoint at {:#x}", bp);
+                let res = inferior.write_byte(*bp.0, 0xcc);
+                match res {
+                    Ok(orig_byte) => {
+                        // update original byte when actually setting breakpoints
+                        bp.1.orig_byte = orig_byte;
+                    }
+                    Err(_) => {
+                        println!("Unable to set breakpoint at {:#x}", *bp.0);
+                    }
                 }
             }
             return Some(inferior);
@@ -83,7 +97,34 @@ impl Inferior {
         })
     }
     // make process to continue executing
-    pub fn cont(&self) -> Result<Status, nix::Error> {
+    pub fn cont(&mut self, breakpoints: &HashMap<usize, Breakpoint>) -> Result<Status, nix::Error> {
+        let regs = ptrace::getregs(self.pid())?;
+        let rip = regs.rip as usize;
+        // if inferior is stopped at a breakpoint
+        if breakpoints.contains_key(&rip) {
+            // go to next instruction
+            ptrace::step(self.pid(), None)?;
+            let result = self.wait(Some(WaitPidFlag::WUNTRACED));
+            match result {
+                Ok(status) => match status {
+                    Status::Exited(_) | Status::Signaled(_) => {
+                        return Ok(status);
+                    }
+                    Status::Stopped(signal, _) => {
+                        if signal == Signal::SIGTRAP {
+                            // restore 0xcc in the breakpoint location
+                            let res = self.write_byte(rip, 0xcc);
+                            if res.is_err() {
+                                println!("Unable to set breakpoint at {:#x}", rip);
+                            }
+                        }
+                    }
+                },
+                Err(e) => {
+                    println!("{}", e);
+                }
+            }
+        }
         ptrace::cont(self.pid(), None)?;
         self.wait(Some(WaitPidFlag::WUNTRACED))
     }
@@ -105,11 +146,11 @@ impl Inferior {
                     println!("There's no code at {:#x}", rip);
                     return Ok(());
                 }
-                Some(val) => val
+                Some(val) => val,
             };
             let func = match debug_data.get_function_from_addr(rip as usize) {
                 None => return Ok(()),
-                Some(val) => val
+                Some(val) => val,
             };
             println!("{} ({})", func, line);
             if func == "main" {

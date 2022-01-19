@@ -16,8 +16,8 @@ impl DebuggerCommand {
                     args.iter().map(|s| s.to_string()).collect(),
                 ))
             }
-            "c" | "cont" | "continue" => { Some(DebuggerCommand::Continue) }
-            "bt" | "back" | "backtrace" => { Some(DebuggerCommand::Backtrace) }
+            "c" | "cont" | "continue" => Some(DebuggerCommand::Continue),
+            "bt" | "back" | "backtrace" => Some(DebuggerCommand::Backtrace),
             "b" | "break" => {
                 let addr = tokens[1];
                 Some(DebuggerCommand::Break(addr.to_string()))
